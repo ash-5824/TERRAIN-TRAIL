@@ -1,0 +1,46 @@
+
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+
+  /* High-Contrast Alpine White-Bluish Palette */
+  --color-gray-950: #f0f7ff; /* Clean ice-white canvas */
+  --color-gray-900: #ffffff; /* Pure white card containers */
+  --color-gray-850: #f4f8fe; /* Sky-blue subtle fills */
+  --color-gray-800: #e2e8f0; /* Slate-200 borders */
+  --color-gray-750: #cbd5e1; /* Slate-300 borders */
+  --color-gray-700: #94a3b8; /* Slate-400 input borders */
+  --color-gray-600: #64748b; /* Slate-500 muted text */
+  --color-gray-400: #475569; /* Slate-600 secondary text */
+  --color-gray-300: #334155; /* Slate-700 prominent text */
+  --color-gray-200: #1e293b; /* Deep slate primary text */
+  --color-gray-100: #0f172a; /* Midnight navy headings */
+}
+
+body {
+  background-color: #f0f7ff;
+  color: #1e293b;
+  font-family: Arial, Helvetica, sans-serif;
+  background-image: 
+    radial-gradient(at 15% 15%, rgba(37, 99, 235, 0.08) 0px, transparent 50%),
+    radial-gradient(at 85% 85%, rgba(14, 165, 233, 0.06) 0px, transparent 50%);
+  background-attachment: fixed;
+}
+
+/* Alpine Scrollbar Styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+::-webkit-scrollbar-thumb {
+  background: #93c5fd;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3b82f6;
+}
