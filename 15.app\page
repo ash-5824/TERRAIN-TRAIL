@@ -1,0 +1,13 @@
+
+The primary frontend is located at 
+app/page.tsx
+. It contains:
+
+Fixed YouTube-style stationary left sidebar with tab routing and preset mountain profiles.
+Top frosted search navigation bar with live geocoding dropdown.
+Tab 1: AI Terrain Scanner & Emergency Verdict Dossier.
+Tab 2: Community Crowdsourced Photo Gallery with search and risk filters.
+Tab 3: Interactive OpenStreetMap elevation & trail mapping canvas.
+Tab 4: 911/112 SOS quick dispatch & acoustic/optical distress siren beacon.
+Tab 5: API Settings & Neon Serverless PostgreSQL persistence indicator.
+3 Full Modals: Lightbox Image Inspector, Ranger Sign In / Sign Up, and Community Photo Upload.
