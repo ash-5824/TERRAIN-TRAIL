@@ -304,3 +304,81 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
+14. app/api/reports/route.ts
+import { NextResponse } from "next/server";
+import { sql, initDB } from "@/lib/db";
+
+export async function GET(request: Request) {
+  try {
+    const { searchParams } = new URL(request.url);
+    const query = searchParams.get("q")?.trim().toLowerCase() || "";
+    const riskFilter = searchParams.get("risk")?.trim() || "";
+    const authorFilter = searchParams.get("author")?.trim().toLowerCase() || "";
+
+    await initDB();
+    const rows = await sql`
+      SELECT id, latitude, longitude, risk_level, hazard_type, safe_to_proceed, recommended_action, image_data, author_name, author_role, author_avatar, location_name, created_at
+      FROM hazard_reports
+      ORDER BY created_at DESC
+      LIMIT 60;
+    `;
+
+    interface ReportRow {
+      id?: string | number;
+      latitude?: string | number;
+      longitude?: string | number;
+      risk_level?: string;
+      hazard_type?: string;
+      safe_to_proceed?: boolean;
+      recommended_action?: string;
+      image_data?: string | null;
+      author_name?: string | null;
+      author_role?: string | null;
+      author_avatar?: string | null;
+      location_name?: string | null;
+      created_at?: string | Date;
+    }
+
+    if (Array.isArray(rows) && rows.length > 0) {
+      let reports = (rows as ReportRow[]).map((r) => ({
+        id: r.id?.toString() || Date.now().toString(),
+        timestamp: r.created_at ? new Date(r.created_at).toLocaleString() : "Recently",
+        latitude: typeof r.latitude === "number" ? r.latitude : parseFloat(String(r.latitude)) || 0,
+        longitude: typeof r.longitude === "number" ? r.longitude : parseFloat(String(r.longitude)) || 0,
+        risk_level: r.risk_level || "Moderate",
+        hazard_type: r.hazard_type || "Terrain Hazard",
+        safe_to_proceed: Boolean(r.safe_to_proceed),
+        recommended_action: r.recommended_action || "Proceed with caution.",
+        image_url: r.image_data || undefined,
+        author_name: r.author_name || "Community Scout",
+        author_role: r.author_role || "Trail Scout",
+        author_avatar: r.author_avatar || "CS",
+        location_name: r.location_name || "Mountain Sector",
+      }));
+
+      if (query) {
+        reports = reports.filter(
+          (r) =>
+            r.hazard_type.toLowerCase().includes(query) ||
+            r.recommended_action.toLowerCase().includes(query) ||
+            r.location_name.toLowerCase().includes(query) ||
+            r.author_name.toLowerCase().includes(query)
+        );
+      }
+
+      if (riskFilter && riskFilter !== "All") {
+        reports = reports.filter((r) => r.risk_level.toLowerCase() === riskFilter.toLowerCase());
+      }
+
+      if (authorFilter) {
+        reports = reports.filter((r) => r.author_name.toLowerCase().includes(authorFilter));
+      }
+
+      return NextResponse.json(reports);
+    }
+    return NextResponse.json([]);
+  } catch (err: unknown) {
+    console.warn("Public reports query error (gracefully caught):", err);
+    return NextResponse.json([]);
+  }
+}
