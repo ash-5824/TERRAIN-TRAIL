@@ -1,0 +1,832 @@
+add
+api\analyze
+route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { GoogleGenAI, Type } from "@google/genai";
+import { initDB, sql } from "@/lib/db";
+
+const MAX_BODY_SIZE = 4.5 * 1024 * 1024; // 4.5 MB request ceiling
+
+export async function POST(request: NextRequest) {
+  try {
+    // 1. Enforce payload size limit at header level if present
+    const contentLength = request.headers.get("content-length");
+    if (contentLength && parseInt(contentLength, 10) > MAX_BODY_SIZE) {
+      return NextResponse.json({ error: "Payload Too Large" }, { status: 413 });
+    }
+
+    let formData: FormData;
+    try {
+      formData = await request.formData();
+    } catch {
+      return NextResponse.json({ error: "Invalid form data in request" }, { status: 400 });
+    }
+
+    const imageFile = formData.get("image");
+    const latitudeValue = formData.get("latitude");
+    const longitudeValue = formData.get("longitude");
+
+    // 2. Validate presence and types of required fields
+    if (!imageFile || !(imageFile instanceof File) || imageFile.size === 0) {
+      return NextResponse.json({ error: "Invalid or missing image file" }, { status: 400 });
+    }
+
+    if (latitudeValue === null || longitudeValue === null || latitudeValue === "" || longitudeValue === "") {
+      return NextResponse.json({ error: "Missing coordinates" }, { status: 400 });
+    }
+
+    // 3. MIME type validation (Strict whitelist: JPEG, PNG, WebP. Reject HEIC/HEIF)
+    const allowedMimeTypes = ["image/jpeg", "image/png", "image/webp"];
+    if (!allowedMimeTypes.includes(imageFile.type)) {
+      return NextResponse.json({ error: "Unsupported image format. Allowed formats: JPEG, PNG, WebP." }, { status: 400 });
+    }
+
+    // 4. Validate coordinates
+    const latitude = Number(latitudeValue);
+    const longitude = Number(longitudeValue);
+
+    if (
+      Number.isNaN(latitude) ||
+      !Number.isFinite(latitude) ||
+      latitude < -90 ||
+      latitude > 90 ||
+      Number.isNaN(longitude) ||
+      !Number.isFinite(longitude) ||
+      longitude < -180 ||
+      longitude > 180
+    ) {
+      return NextResponse.json({ error: "Invalid coordinates (latitude must be between -90 and 90, longitude between -180 and 180)" }, { status: 400 });
+    }
+
+    // 5. In-code array buffer size check
+    const arrayBuffer = await imageFile.arrayBuffer();
+    if (arrayBuffer.byteLength > MAX_BODY_SIZE) {
+      return NextResponse.json({ error: "Image too large" }, { status: 413 });
+    }
+
+    // 6. Check Gemini API configuration
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey || apiKey === "YOUR_API_KEY_HERE") {
+      console.error("[Configuration Error] GEMINI_API_KEY is not configured or using placeholder value.");
+      return NextResponse.json({ error: "Internal server error: AI service unconfigured" }, { status: 500 });
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+
+    // 7. Define structured response schema
+    const responseSchema = {
+      type: Type.OBJECT,
+      properties: {
+        risk_level: {
+          type: Type.STRING,
+          enum: ["Low", "Moderate", "Critical"],
+        },
+        hazard_type: {
+          type: Type.STRING,
+        },
+        safe_to_proceed: {
+          type: Type.BOOLEAN,
+        },
+        key_observations: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.STRING,
+          },
+        },
+        recommended_action: {
+          type: Type.STRING,
+        },
+      },
+      required: [
+        "risk_level",
+        "hazard_type",
+        "safe_to_proceed",
+        "key_observations",
+        "recommended_action",
+      ],
+    };
+
+    const systemInstruction = `You are an expert visual terrain-hazard assessment assistant.
+
+Analyze the provided photograph for visible indicators associated with:
+- landslides
+- tension cracks
+- mud flows
+- unstable slopes
+- rockfall potential
+- debris
+- visible road obstruction
+- other clearly visible terrain hazards
+
+The photograph is the primary evidence.
+
+The provided GPS coordinates are geographic metadata only. Do not claim to know current weather, rainfall, geological stability, road closures, government warnings, satellite information, or other location-specific facts unless they are explicitly provided in the input.
+
+Do not invent hazards that are not visually supported.
+
+Do not treat absence of a visible hazard as proof that the area is safe.
+
+Return ONLY valid JSON matching the provided response schema.
+
+The "safe_to_proceed" field must be interpreted conservatively:
+- true only when the photographed conditions show no obvious visible hazard and there is sufficient visual evidence to support that limited assessment
+- false whenever a visible hazard exists or the image is insufficient/ambiguous for a reasonably cautious assessment
+
+Even when safe_to_proceed is true, the recommendation must not imply a guarantee of real-world safety.`;
+
+    const base64Image = Buffer.from(arrayBuffer).toString("base64");
+    const mimeType = imageFile.type || "image/jpeg";
+
+    let result;
+    try {
+      result = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: `Coordinates: latitude ${latitude}, longitude ${longitude}.`,
+              },
+              {
+                inlineData: {
+                  mimeType,
+                  data: base64Image,
+                },
+              },
+            ],
+          },
+        ],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema,
+          systemInstruction,
+        },
+      });
+    } catch (upstreamError) {
+      console.error("[Gemini API Error]", upstreamError);
+      return NextResponse.json({ error: "Failed to communicate with AI visual assessment service" }, { status: 502 });
+    }
+
+    const text = result?.text;
+    if (!text) {
+      return NextResponse.json({ error: "Model returned no content" }, { status: 502 });
+    }
+
+    let parsed: {
+      risk_level: "Low" | "Moderate" | "Critical";
+      hazard_type: string;
+      safe_to_proceed: boolean;
+      key_observations: string[];
+      recommended_action: string;
+    };
+
+    try {
+      parsed = JSON.parse(text);
+    } catch (parseError) {
+      console.error("[Model Output Parse Error]", parseError);
+      return NextResponse.json({ error: "Model returned invalid JSON" }, { status: 502 });
+    }
+
+    // Defensive schema validation
+    const isValid =
+      ["Low", "Moderate", "Critical"].includes(parsed.risk_level) &&
+      typeof parsed.hazard_type === "string" &&
+      typeof parsed.safe_to_proceed === "boolean" &&
+      Array.isArray(parsed.key_observations) &&
+      parsed.key_observations.every((item) => typeof item === "string") &&
+      typeof parsed.recommended_action === "string";
+
+    if (!isValid) {
+      console.error("[Model Output Schema Validation Failed]", parsed);
+      return NextResponse.json({ error: "Model returned malformed schema" }, { status: 502 });
+    }
+
+    // 8. Database persistence (Graceful fallback if DB is unconfigured or fails)
+    try {
+      await initDB();
+      const dbUrl = process.env.DATABASE_URL;
+      if (dbUrl && !dbUrl.includes("placeholder")) {
+        await sql`
+          INSERT INTO hazard_reports (
+            latitude,
+            longitude,
+            risk_level,
+            hazard_type,
+            safe_to_proceed,
+            recommended_action
+          ) VALUES (
+            ${latitude},
+            ${longitude},
+            ${parsed.risk_level},
+            ${parsed.hazard_type},
+            ${parsed.safe_to_proceed},
+            ${parsed.recommended_action}
+          );
+        `;
+        console.log("[Database] Persisted hazard report successfully.");
+      }
+    } catch (dbError) {
+      // Log server-side error, but DO NOT break the primary API response
+      console.error("[Database Persistence Error]", dbError);
+    }
+
+    // 9. Return the verified analysis result
+    return NextResponse.json(parsed, { status: 200 });
+  } catch (error) {
+    console.error("[Analyze API Handler Error]", error);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  }
+}
+global.css 
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+layout.tsx
+import type { Metadata, Viewport } from "next";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "Terrain & Trail Guard",
+  description: "AI Terrain Hazard Assessment",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en">
+      <body className="bg-gray-950 text-white min-h-screen">
+        {children}
+      </body>
+    </html>
+  );
+}
+page.tsx
+"use client";
+
+import { useState, useEffect } from "react";
+import { Loader2, MapPin, Camera, AlertTriangle, CheckCircle, AlertCircle, ShieldAlert } from "lucide-react";
+
+type AnalysisResult = {
+  risk_level: "Low" | "Moderate" | "Critical";
+  hazard_type: string;
+  safe_to_proceed: boolean;
+  key_observations: string[];
+  recommended_action: string;
+};
+
+const badgeStyles: Record<string, string> = {
+  Low: "bg-green-600 text-white",
+  Moderate: "bg-orange-500 text-white",
+  Critical: "bg-red-600 text-white",
+};
+
+export default function Home() {
+  const [location, setLocation] = useState<{ lat: number; lng: number } | null>(null);
+  const [locationError, setLocationError] = useState<string | null>(null);
+  const [locationLoading, setLocationLoading] = useState(false);
+
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [uploadFile, setUploadFile] = useState<File | Blob | null>(null);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
+  const [imageError, setImageError] = useState<string | null>(null);
+  const [isCompressing, setIsCompressing] = useState(false);
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
+
+  // Cleanup object URLs to avoid memory leaks
+  useEffect(() => {
+    return () => {
+      if (imagePreviewUrl) {
+        URL.revokeObjectURL(imagePreviewUrl);
+      }
+    };
+  }, [imagePreviewUrl]);
+
+  // Geolocation trigger on explicit user button click
+  const handleGetLocation = () => {
+    setLocationError(null);
+    if (!navigator.geolocation) {
+      setLocationError("Geolocation is not supported by your browser.");
+      return;
+    }
+
+    setLocationLoading(true);
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        setLocationLoading(false);
+        setLocation({
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+        });
+      },
+      (err) => {
+        setLocationLoading(false);
+        let msg = "Unable to retrieve your location.";
+        if (err.code === 1) msg = "Location permission denied. Please enable GPS permissions in your browser.";
+        else if (err.code === 2) msg = "Location position unavailable. Check GPS signal.";
+        else if (err.code === 3) msg = "Location request timed out. Please try again.";
+        setLocationError(msg);
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 0,
+      }
+    );
+  };
+
+  // Compression helper with bounded 3-step retry (0.8 -> 0.6 -> 0.4)
+  const compressImage = (file: File, maxSize: number): Promise<Blob | null> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        const canvas = document.createElement("canvas");
+        let { width, height } = img;
+        const maxDim = 1920;
+        if (width > maxDim || height > maxDim) {
+          const ratio = Math.min(maxDim / width, maxDim / height);
+          width = Math.floor(width * ratio);
+          height = Math.floor(height * ratio);
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return resolve(null);
+        ctx.drawImage(img, 0, 0, width, height);
+
+        let attempt = 0;
+        const qualities = [0.8, 0.6, 0.4];
+
+        const tryCompress = () => {
+          if (attempt >= qualities.length) {
+            resolve(null);
+            return;
+          }
+          canvas.toBlob(
+            (blob) => {
+              if (!blob) {
+                resolve(null);
+                return;
+              }
+              if (blob.size < maxSize) {
+                resolve(blob);
+              } else {
+                attempt++;
+                tryCompress();
+              }
+            },
+            "image/jpeg",
+            qualities[attempt]
+          );
+        };
+        tryCompress();
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(null);
+      };
+      img.src = url;
+    });
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    setImageError(null);
+    setError(null);
+    setAnalysisResult(null);
+
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Strict client-side format validation (Block HEIC / HEIF immediately before preview)
+    const allowed = ["image/jpeg", "image/png", "image/webp"];
+    if (!allowed.includes(file.type)) {
+      setImageError(
+        "That photo format isn't supported (HEIC/HEIF from some iPhone cameras isn't accepted). Please choose a JPEG or PNG photo instead, or check your camera's format setting."
+      );
+      if (imagePreviewUrl) {
+        URL.revokeObjectURL(imagePreviewUrl);
+        setImagePreviewUrl(null);
+      }
+      setImageFile(null);
+      setUploadFile(null);
+      return;
+    }
+
+    // Always create preview from the original, uncompressed file
+    if (imagePreviewUrl) {
+      URL.revokeObjectURL(imagePreviewUrl);
+    }
+    setImageFile(file);
+    setImagePreviewUrl(URL.createObjectURL(file));
+
+    const MAX_UPLOAD_SIZE = 4 * 1024 * 1024; // 4 MB target margin
+
+    // Check if compression is required
+    if (file.size < MAX_UPLOAD_SIZE) {
+      setUploadFile(file);
+      return;
+    }
+
+    // Run bounded client-side compression
+    setIsCompressing(true);
+    const compressed = await compressImage(file, MAX_UPLOAD_SIZE);
+    setIsCompressing(false);
+
+    if (!compressed) {
+      setImageError("This photo is too large to upload even after compression. Please try a different photo or a lower-resolution shot.");
+      setUploadFile(null);
+    } else {
+      setUploadFile(compressed);
+    }
+  };
+
+  const handleSubmit = async () => {
+    if (!uploadFile || !location) {
+      setError("Both a photo and your location are required.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setAnalysisResult(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("image", uploadFile);
+      formData.append("latitude", String(location.lat));
+      formData.append("longitude", String(location.lng));
+
+      const res = await fetch("/api/analyze", {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || "An error occurred during analysis.");
+      } else {
+        setAnalysisResult(data);
+      }
+    } catch {
+      setError("Network failure or unable to reach the server.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <main className="max-w-md mx-auto p-4 flex flex-col gap-5 min-h-screen">
+      {/* Header */}
+      <header className="text-center py-4 border-b border-gray-800">
+        <h1 className="text-2xl font-bold flex items-center justify-center gap-2 text-white">
+          <AlertTriangle className="text-orange-500 h-6 w-6" />
+          Terrain & Trail Guard
+        </h1>
+        <p className="text-gray-400 text-sm mt-1">AI Terrain Hazard Assessment</p>
+      </header>
+
+      {/* Location Card */}
+      <section className="bg-gray-900 rounded-xl p-4 border border-gray-800 shadow-md">
+        <h2 className="text-base font-semibold mb-3 flex items-center gap-2 text-gray-200">
+          <MapPin size={18} className="text-blue-400" /> Location Information
+        </h2>
+        {location ? (
+          <div className="bg-gray-950 p-3 rounded-lg border border-gray-800 text-sm text-gray-300 flex items-center justify-between">
+            <div>
+              <div className="text-xs text-gray-500 uppercase tracking-wide font-semibold">Captured GPS Coordinates</div>
+              <div className="font-mono text-sm mt-0.5">
+                {location.lat.toFixed(5)}, {location.lng.toFixed(5)}
+              </div>
+            </div>
+            <button
+              onClick={handleGetLocation}
+              disabled={locationLoading}
+              className="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 px-2.5 py-1.5 rounded transition-colors"
+            >
+              Update
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={handleGetLocation}
+            disabled={locationLoading}
+            className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-800 text-white font-medium py-3 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-900"
+          >
+            {locationLoading ? (
+              <>
+                <Loader2 className="animate-spin h-4 w-4" />
+                <span>Acquiring GPS Position...</span>
+              </>
+            ) : (
+              <>
+                <MapPin size={18} />
+                <span>Get My Location</span>
+              </>
+            )}
+          </button>
+        )}
+        {locationError && (
+          <div className="mt-2.5 text-red-400 text-sm bg-red-950/40 border border-red-900/50 p-2.5 rounded-lg flex items-start gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+            <span>{locationError}</span>
+          </div>
+        )}
+      </section>
+
+      {/* Photo Card */}
+      <section className="bg-gray-900 rounded-xl p-4 border border-gray-800 shadow-md">
+        <h2 className="text-base font-semibold mb-3 flex items-center gap-2 text-gray-200">
+          <Camera size={18} className="text-emerald-400" /> Terrain Photograph
+        </h2>
+
+        <label className="w-full bg-gray-800 hover:bg-gray-700 text-white font-medium py-3 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer mb-3 focus-within:ring-2 focus-within:ring-emerald-500 focus-within:ring-offset-2 focus-within:ring-offset-gray-900">
+          <Camera size={18} />
+          <span>Take Photo / Choose Image</span>
+          <input
+            type="file"
+            accept="image/jpeg,image/png,image/webp"
+            capture="environment"
+            className="sr-only"
+            onChange={handleFileChange}
+          />
+        </label>
+
+        {isCompressing && (
+          <div className="text-xs text-yellow-400 flex items-center gap-2 mb-3 bg-yellow-950/30 p-2 rounded border border-yellow-900/40">
+            <Loader2 className="animate-spin h-3.5 w-3.5" /> Optimizing image for upload...
+          </div>
+        )}
+
+        {imageError && (
+          <div className="bg-red-950/40 border border-red-900 text-red-400 text-sm p-3 rounded-lg mb-3 flex items-start gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+            <span>{imageError}</span>
+          </div>
+        )}
+
+        {imagePreviewUrl && (
+          <div className="relative aspect-video rounded-lg overflow-hidden border border-gray-800 bg-black">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={imagePreviewUrl}
+              alt="Selected terrain preview for analysis"
+              className="object-contain w-full h-full"
+            />
+          </div>
+        )}
+      </section>
+
+      {/* Submit Action */}
+      <button
+        onClick={handleSubmit}
+        disabled={loading || isCompressing || !uploadFile || !location}
+        className="w-full bg-orange-600 hover:bg-orange-700 disabled:bg-gray-800 disabled:text-gray-500 text-white font-bold py-3.5 px-4 rounded-xl transition-colors flex items-center justify-center gap-2 shadow-lg focus:outline-none focus:ring-2 focus:ring-orange-500 focus:ring-offset-2 focus:ring-offset-gray-950"
+      >
+        {loading ? (
+          <>
+            <Loader2 className="animate-spin h-5 w-5" />
+            <span>Analyzing Terrain...</span>
+          </>
+        ) : (
+          <span>Analyze Terrain</span>
+        )}
+      </button>
+
+      {/* Global Error Banner */}
+      {error && (
+        <div className="bg-red-950/50 border border-red-900 text-red-300 p-4 rounded-xl flex items-start gap-2.5" aria-live="assertive">
+          <ShieldAlert className="h-5 w-5 shrink-0 text-red-400 mt-0.5" />
+          <div className="text-sm">
+            <strong className="block font-semibold text-red-200">Analysis Error</strong>
+            {error}
+          </div>
+        </div>
+      )}
+
+      {/* Result Card */}
+      {analysisResult && (
+        <section className="bg-gray-900 rounded-xl p-5 border border-gray-800 shadow-md flex flex-col gap-4" aria-live="polite">
+          <div className="flex items-start justify-between border-b border-gray-800 pb-3">
+            <h3 className="text-lg font-bold text-white">Hazard Assessment</h3>
+            <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${badgeStyles[analysisResult.risk_level] || "bg-gray-600 text-white"}`}>
+              {analysisResult.risk_level} Risk
+            </span>
+          </div>
+
+          <div>
+            <div className="text-gray-400 text-xs uppercase font-semibold tracking-wider">Identified Hazard Type</div>
+            <div className="font-semibold text-base text-gray-100 mt-0.5">{analysisResult.hazard_type}</div>
+          </div>
+
+          <div className="bg-gray-950 p-3.5 rounded-lg border border-gray-800">
+            <div className="text-gray-400 text-xs uppercase font-semibold tracking-wider">Visual conditions assessment</div>
+            <div className="font-medium flex items-center gap-2 mt-1">
+              {analysisResult.safe_to_proceed ? (
+                <div className="flex items-center gap-1.5 text-green-400 font-semibold">
+                  <CheckCircle className="h-4 w-4" />
+                  <span>No obvious visible hazard detected</span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5 text-orange-400 font-semibold">
+                  <AlertTriangle className="h-4 w-4" />
+                  <span>Potential visible hazard detected</span>
+                </div>
+              )}
+            </div>
+            <p className="text-xs text-gray-400 mt-2 leading-relaxed">
+              This is based only on visible conditions in the submitted image and does not guarantee that the route is safe.
+            </p>
+          </div>
+
+          <div>
+            <div className="text-gray-400 text-xs uppercase font-semibold tracking-wider mb-2">Key Visual Observations</div>
+            <ul className="list-disc pl-5 space-y-1.5 text-sm text-gray-300">
+              {analysisResult.key_observations.map((obs, i) => (
+                <li key={i}>{obs}</li>
+              ))}
+            </ul>
+          </div>
+
+          <div className="bg-gray-950 p-3.5 rounded-lg border border-gray-800">
+            <div className="text-gray-400 text-xs uppercase font-semibold tracking-wider mb-1">Recommended Action</div>
+            <div className="text-sm font-medium text-gray-200 leading-relaxed">{analysisResult.recommended_action}</div>
+          </div>
+        </section>
+      )}
+
+      {/* Safety Disclaimer Footer */}
+      <footer className="text-xs text-gray-500 text-center pb-8 border-t border-gray-800 pt-4 mt-auto">
+        <p className="font-bold text-gray-400 mb-1">AI visual assessment only.</p>
+        <p className="mb-1">Not an emergency directive or guarantee of real-world safety.</p>
+        <p>Always follow local authority directives and on-site warnings.</p>
+      </footer>
+    </main>
+  );
+}
+db.ts
+import { neon } from "@neondatabase/serverless";
+
+// Fallback to empty string if DATABASE_URL is not set so neon client constructor does not crash on module load
+const databaseUrl = process.env.DATABASE_URL || "";
+
+export const sql = neon(databaseUrl);
+
+export async function initDB(): Promise<void> {
+  try {
+    if (!databaseUrl || databaseUrl.includes("placeholder")) {
+      console.warn("[Database] DATABASE_URL is not configured or is using placeholder values. Skipping live DB table init.");
+      return;
+    }
+
+    await sql`
+      CREATE TABLE IF NOT EXISTS hazard_reports (
+        id SERIAL PRIMARY KEY,
+        latitude FLOAT NOT NULL,
+        longitude FLOAT NOT NULL,
+        risk_level TEXT NOT NULL,
+        hazard_type TEXT NOT NULL,
+        safe_to_proceed BOOLEAN NOT NULL,
+        recommended_action TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `;
+    console.log("[Database] Initialized table 'hazard_reports' successfully.");
+  } catch (error) {
+    console.error("[Database] Error initializing database schema:", error);
+  }
+}
+.env.local
+GEMINI_API_KEY="hidden key"
+DATABASE_URL=postgresql://placeholder:placeholder@placeholder.neon.tech/neondb?sslmode=require
+.gitignore
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# local env files
+.env*.local
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+
+# vercel
+.vercel
+package.json
+{
+  "name": "terrain-trail-guard",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "@google/genai": "^0.1.1",
+    "@neondatabase/serverless": "^0.10.4",
+    "lucide-react": "^0.475.0"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "postcss": "^8",
+    "tailwindcss": "^3.4.1",
+    "eslint": "^8",
+    "eslint-config-next": "15.0.0"
+  }
+}
+postcss.config.mjs
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+tailwind.config.ts
+import type { Config } from "tailwindcss";
+
+const config: Config = {
+  content: [
+    "./app/**/*.{js,ts,jsx,tsx,mdx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+};
+export default config;
+tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": ["./*"]
+    }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+
+
+
